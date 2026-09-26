@@ -1,10 +1,11 @@
 # message-flow — the Flow + Message semi-sandbox runner.
 #
-# Run it as `nix run .#message-flow`. It is a runner, never a check: it keeps
-# the caller's real HOME in place for seats (Claude, Codex, Herdr), and
-# isolates only the two Nexuses under test — each gets its own HOME,
-# XDG_RUNTIME_DIR, state and sockets under a fresh state root, removed in an
-# exit trap. No login file is ever copied.
+# Run it as `nix run .#message-flow`. It is a runner, never a check: each
+# tested Nexus gets its own isolated HOME/XDG_RUNTIME_DIR/state/sockets under
+# a fresh state root, and any seat Flow launches gets its own isolated
+# identity too — its credential files copied in, everything else generated
+# fresh (see `flake.lib.seatCredentialEnv`) — removed in an exit trap. No
+# config file is ever copied.
 #
 # This is the skeleton. The scenario drive and its assertions belong in the
 # marked section below.
@@ -27,7 +28,7 @@ pkgs.writeShellApplication {
     pkgs.jq
   ];
 
-  meta.description = "Flow 0.16 + Message 0.16 semi-sandbox: seats keep the real HOME in place, each Nexus isolated on its own state root, driven with the cheapest model.";
+  meta.description = "Flow 0.16 + Message 0.16 semi-sandbox: each Nexus and any seat it launches isolated on its own generated identity, driven with the cheapest model.";
 
   text = ''
     realHome="$HOME"
@@ -38,13 +39,15 @@ pkgs.writeShellApplication {
 
     ${flake.lib.isolatedComponentEnv "flow"}
     ${flake.lib.isolatedComponentEnv "message"}
+    ${flake.lib.seatCredentialEnv}
 
-    # Flow's own state is isolated; a seat it launches still finds the
-    # living's real Codex and Claude trust and credentials, never copied.
+    # Flow's own state is isolated; any seat it launches gets the generated
+    # identity above, never the living's real ~/.claude.json or
+    # ~/.codex/config.toml.
     export HOME="$flowHome"
     export XDG_RUNTIME_DIR="$flowRuntime"
-    export CODEX_HOME="$realHome/.codex"
-    export CLAUDE_CONFIG_DIR="$realHome/.claude"
+    export CODEX_HOME="$seatCodexHome"
+    export CLAUDE_CONFIG_DIR="$seatHome/.claude"
     ${flow.start}
 
     export HOME="$messageHome"
@@ -63,9 +66,18 @@ pkgs.writeShellApplication {
     #   ${message.client} / ${message.metaClient} reach Message via:
     #     XDG_RUNTIME_DIR="$messageRuntime" ${message.client} ...
     #   $model             the cheapest model, overridable by PERSONA_TEST_MODEL
-    #   $realHome          the living's own HOME, where seats run in place
+    #   $seatHome/$seatCodexHome/$seatDir   the seat identity a Flow-launched
+    #                      Claude or Codex sees; $seatHome/.claude.json and
+    #                      $seatCodexHome/config.toml are plain writable
+    #                      files, not store paths, so a seat may write back
+    #                      to them during the run.
     #   $stateRoot         the isolated root, removed on exit
-    echo "message-flow: skeleton only — Flow on $flowRuntime, Message on $messageRuntime, seats on $realHome, model $model"
+    #
+    # Left for the suite move: Herdr's own config and allowlist for the
+    # sandbox's session — Flow launches seats through Herdr, whose
+    # executable allowlist and per-session config are not yet generated
+    # here, only Claude's and Codex's own files.
+    echo "message-flow: skeleton only — Flow on $flowRuntime, Message on $messageRuntime, seat on $seatDir, model $model"
     # --------------------------------------------------------------------
 
     export XDG_RUNTIME_DIR="$messageRuntime"
