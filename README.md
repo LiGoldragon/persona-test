@@ -53,6 +53,7 @@ one-line change against `flake.lib.components`.
 
 ## Running
 
+    find . -name '*.nix' -exec nix fmt {} +
     nix flake check --no-build --option allow-import-from-derivation false
     nix flake check
     nix run .#message-flow

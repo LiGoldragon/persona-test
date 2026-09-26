@@ -26,7 +26,9 @@ touched no Rust.
 - A pure scenario is a check: no network, no credentials.
 - A semi-sandbox is a `packages/<scenario>.nix` runner with a `mktemp -d` state
   root and an exit trap. Never a check, never `__impure`, never `__noChroot`.
-- Run `nix fmt` before every commit.
+- Run `nix fmt` before every commit. `pkgs.nixfmt` takes files, not a
+  directory, so format the tree with
+  `find . -name '*.nix' -exec nix fmt {} +` (or pass the paths you touched).
 - Evaluate before building:
   `nix flake check --no-build --option allow-import-from-derivation false`,
   then `nix flake check`.
