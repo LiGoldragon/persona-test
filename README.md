@@ -31,12 +31,12 @@ no credentials: `pkgs.testers.runNixOSTest` when it needs services or several
 machines, `pkgs.runCommand` otherwise.
 
 A **semi-sandbox** needs the living's logins, the network, or a live model, so it
-is a runner, not a check: `nix run .#<scenario>`. It makes a fresh state root
-with `mktemp -d`, copies in at run time only the login files its components
-need, starts every component against that root, drives the cheapest model
-(Haiku for Claude, Luna for Codex) unless given another, asserts, and removes
-the root in an exit trap. Credentials reach only that runtime root — never the
-store. A semi-sandbox is never a check, never `__impure`, never `__noChroot`.
+is a runner, not a check: `nix run .#<scenario>`. It keeps the living's real
+HOME in place for seats — Claude, Codex, Herdr — and isolates only the
+components under test: each gets its own HOME, XDG_RUNTIME_DIR, state and
+sockets under a fresh `mktemp -d` state root, removed in an exit trap. No
+login file is ever copied. A semi-sandbox is never a check, never `__impure`,
+never `__noChroot`.
 
 ## Naming
 
