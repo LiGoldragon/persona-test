@@ -104,7 +104,7 @@ class Reply:
 
     @classmethod
     def read(cls, texts):
-        found = dict(verdict=None, prompt_sha256=None, flow_id=None, session_id=None, pane_id=None)
+        found = dict(verdict=None, prompt_sha256=None, flow_id=None, session_id=None, pane_id=None, phases=[])
         for text in texts:
             for frame in Datom.frames(text):
                 head = cls.head(frame)
@@ -122,6 +122,8 @@ class Reply:
                 elif head == "LaunchPending":
                     attempt = frame[1]
                     found["verdict"] = "LaunchPending." + str(attempt[4])
+                    if str(attempt[4]) not in found["phases"]:
+                        found["phases"].append(str(attempt[4]))
                     if HEX64.match(attempt[2]):
                         found["prompt_sha256"] = found["prompt_sha256"] or attempt[2]
                     bound = cls.binding(attempt[6])
@@ -183,12 +185,20 @@ class Transcript:
         self.spec = spec
         self.checks = []
 
-    def check(self, name, passed, detail):
-        self.checks.append(dict(name=name, passed=bool(passed), detail=detail))
+    def check(self, name, passed, detail, live_only=False):
+        """A live-only check is one a stand-in seat can only answer by its
+        own fixture rule: under the stand-in it is marked, not witnessed."""
+        record = dict(name=name, passed=bool(passed), detail=detail)
+        if live_only and self.spec.get("seat") == "stand-in":
+            record["live_only"] = True
+            record["detail"] = detail + " [stand-in: this tests the fixture's own rule; witnessed only by a live run]"
+        self.checks.append(record)
         return passed
 
     @staticmethod
     def expansion(path):
+        if not os.path.isfile(path):
+            return None
         with open(path, encoding="utf-8") as handle:
             source = handle.read()
         if source.startswith("---\n"):
@@ -259,6 +269,24 @@ class Transcript:
 
     def judge(self):
         spec = self.spec
+        unavailable = spec.get("unavailable_skill")
+        if unavailable:
+            present = [
+                os.path.join(catalog, name, "SKILL.md")
+                for name in spec["skills"]
+                for catalog in spec["catalogs"]
+                if os.path.isfile(os.path.join(catalog, name, "SKILL.md"))
+            ]
+            found = [path for path in present if os.path.basename(os.path.dirname(path)) == unavailable]
+            others = {os.path.basename(os.path.dirname(path)) for path in present} - {unavailable}
+            wanted = set(spec["skills"]) - {unavailable}
+            if not self.check(
+                "skill-unavailable",
+                not found and others == wanted,
+                "%s is in no catalog Flow reads (%s); the other selected skills are present"
+                % (unavailable, ", ".join(spec["catalogs"])),
+            ):
+                return
         files = self.files()
         if not self.check("transcript-located", len(files) == 1, "%d file(s) named %s.jsonl" % (len(files), spec["session_id"])):
             return
@@ -279,6 +307,7 @@ class Transcript:
             "route",
             wrapped == spec["wrapped"],
             "first turn %s, expected %s" % ("wrapped" if wrapped else "plain", "wrapped" if spec["wrapped"] else "plain"),
+            live_only=True,
         )
         if not self.check("footer-present", typed.endswith(FOOTER), "first turn ends with Flow's receipt footer"):
             return
@@ -319,6 +348,8 @@ class Transcript:
         order = []
         for text in texts:
             for index, expansion in enumerate(expected):
+                if expansion is None:
+                    continue
                 if text == expansion or text.startswith(expansion.rstrip()):
                     order.append(spec["skills"][index])
                     break

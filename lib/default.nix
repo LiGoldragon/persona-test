@@ -51,97 +51,50 @@
     }
   '';
 
-  # A semi-sandbox's shared shell prelude: a fresh state root and an exit
-  # trap that removes it. Every isolated home below — a tested component's or
-  # a seat's — lives under it and is removed with it.
+  # A semi-sandbox's shared shell prelude: a fresh state root and a trap on
+  # every ending signal that removes it. Every isolated home below — a tested
+  # component's or a seat's — lives under it and is removed with it.
   #
   # The root is made under /tmp, not under $TMPDIR: every socket of a run
   # lives under it, an AF_UNIX path carries at most 107 bytes, and a
   # harness's TMPDIR can be long enough to break that. A build sandbox has
   # no /tmp, so a check names its own short base in PERSONA_TEST_ROOT_BASE;
-  # it must be absolute. Needs `shellHelpers` first. A scenario may define
-  # `beforeRootRemoval` to stop what it started and print its report; when
-  # defined, it runs before the root is removed, on success and on failure
-  # alike.
+  # it must be absolute. Needs `shellHelpers` first.
+  #
+  # A scenario may define `beforeRootRemoval` to stop every process it holds
+  # by PID and print its report. Cleanup runs once, whichever of EXIT, INT,
+  # TERM or HUP ends the run: errexit and nounset are dropped inside it, so
+  # no failing step and no unset variable skips the removal. On EXIT the
+  # shell keeps the status it was exiting with (the trap calls no `exit`);
+  # on a signal the run exits with 128 plus the signal's number, and the
+  # EXIT trap that follows finds the cleanup already done.
   isolatedStateRoot = ''
     rootBase="''${PERSONA_TEST_ROOT_BASE:-/tmp}"
     requireAbsolute PERSONA_TEST_ROOT_BASE "$rootBase"
     stateRoot="$(mktemp -d "$rootBase/pt.XXXXXXXX")"
+    cleanupDone=""
     cleanup() {
-      if declare -F beforeRootRemoval >/dev/null; then
-        beforeRootRemoval || true
+      if [ -n "$cleanupDone" ]; then
+        return 0
       fi
-      chmod -R u+w "$stateRoot" 2>/dev/null || true
+      cleanupDone=1
+      set +eu
+      if declare -F beforeRootRemoval >/dev/null; then
+        beforeRootRemoval
+      fi
+      chmod -R u+w "$stateRoot" 2>/dev/null
       rm -rf "$stateRoot"
     }
     trap cleanup EXIT
+    trap 'cleanup; exit 129' HUP
+    trap 'cleanup; exit 130' INT
+    trap 'cleanup; exit 143' TERM
   '';
 
-  # A seat's isolated identity: `$seatHome`, `$seatCodexHome` and `$seatDir`,
-  # every one a writable directory under `$stateRoot/seat`, never a store
-  # path or a symlink to one — Claude and Codex both write back into their
-  # own config and state at run time, and a seat needs to keep doing that.
-  #
-  # Only the two credential files are ever copied, and only they: Claude's
-  # `.credentials.json` and Codex's `auth.json`. Everything else a seat needs
-  # to accept those credentials and trust its own directory is generated
-  # here, at run time, from the real login's *non-secret* account fields
-  # (`oauthAccount`, read with `jq`, never the whole file) — never a copy of
-  # the living's real `~/.claude.json`, `~/.claude/settings.json` or
-  # `~/.codex/config.toml`, whose trust entries and allowlists name the
-  # living's own directories, not the seat's.
-  #
-  # `$realHome` and `$model` must already be set by the caller.
-  # No heredoc here: nixfmt reindents this string's lines, which would move
-  # a heredoc terminator off column zero and break it. Every generated file
-  # is written with jq or printf instead, so reindentation is harmless.
-  seatCredentialEnv = ''
-    seatHome="$stateRoot/seat/home"
-    seatCodexHome="$stateRoot/seat/codex"
-    seatDir="$stateRoot/seat/work"
-    mkdir -p "$seatHome/.claude" "$seatCodexHome" "$seatDir"
-
-    if [ -e "$realHome/.claude/.credentials.json" ]; then
-      cp "$realHome/.claude/.credentials.json" "$seatHome/.claude/.credentials.json"
-      chmod 600 "$seatHome/.claude/.credentials.json"
-    else
-      echo "message-flow: no .claude/.credentials.json under $realHome" >&2
-    fi
-    if [ -e "$realHome/.codex/auth.json" ]; then
-      cp "$realHome/.codex/auth.json" "$seatCodexHome/auth.json"
-      chmod 600 "$seatCodexHome/auth.json"
-    else
-      echo "message-flow: no .codex/auth.json under $realHome" >&2
-    fi
-
-    # The account fields Claude checks a credential file against — nothing
-    # else from the real file, and never its trust entries.
-    account="$(jq '{oauthAccount: (.oauthAccount // {})}' "$realHome/.claude.json" 2>/dev/null || echo '{}')"
-    jq -n --argjson account "$account" --arg dir "$seatDir" \
-      '$account + {
-        hasCompletedOnboarding: true,
-        projects: { ($dir): {
-          allowedTools: [],
-          mcpServers: {},
-          enabledMcpjsonServers: [],
-          disabledMcpjsonServers: [],
-          hasTrustDialogAccepted: true,
-          hasClaudeMdExternalIncludesApproved: false,
-          hasClaudeMdExternalIncludesWarningShown: false
-        } }
-      }' > "$seatHome/.claude.json"
-
-    jq -n '{permissions: {defaultMode: "bypassPermissions"}}' > "$seatHome/.claude/settings.json"
-
-    printf '%s\n' \
-      'approval_policy = "never"' \
-      'sandbox_mode = "danger-full-access"' \
-      "model = \"$model\"" \
-      "" \
-      "[projects.\"$seatDir\"]" \
-      'trust_level = "trusted"' \
-      > "$seatCodexHome/config.toml"
-  '';
+  # No seat login is projected. How a test seat gets a Claude or Codex login
+  # (a copy of the credential, or a share of the live configuration) awaits
+  # the living's ruling; until it is given, nothing here reads, copies or
+  # writes a credential, and the live Claude form of message-flow refuses.
 
   # The cheapest model per harness, the semi-sandbox default. Each is the
   # exact identifier Flow 0.17.4 titles a seat from: its display map knows

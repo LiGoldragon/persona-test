@@ -2,7 +2,7 @@
 #
 #   nix run .#message-flow                  the stand-in mode (the default)
 #   nix run .#message-flow -- stand-in      the same, named
-#   nix run .#message-flow -- live-claude /absolute/path/to/claude
+#   nix run .#message-flow -- live-claude   refuses: awaits the living's ruling
 #   PERSONA_TEST_CODEX_CLIENT=... PERSONA_TEST_CODEX_HOME=... \
 #   PERSONA_TEST_CODEX_CONTROL_SOCKET=... nix run .#message-flow -- live-codex
 #
@@ -11,25 +11,29 @@
 #   stand-in   every seat is the stand-in program of
 #              lib/components/claude-stand-in.nix, which is NOT Claude. No
 #              login, no credential and no configuration directory of the
-#              user is read: the login projection (flake.lib.seatCredentialEnv)
-#              is not called at all. It is what the default run and the check
-#              `message-flow-stand-in` (in the build sandbox, no network) do.
+#              user is read, and no seat login is projected: the login
+#              route awaits the living's ruling. It is what the default run
+#              and the check `message-flow-stand-in` (in the build sandbox,
+#              no network) do.
 #              It checks the scenario's own logic and witnesses nothing about
 #              any harness.
 #   live       reached only by hand, never from a check or the default run,
 #              and refused unless its parameters are given from outside:
-#     live-claude  starts A, B, C and case D run the real Claude harness at
-#              the given absolute path, on the seat identity the login
-#              projection generates. Only this form witnesses anything about
-#              the Claude harness. Cases E, F and J run on the stand-in here
-#              too: each needs a seat that misbehaves in one known way, and
-#              they test Flow's checks, not the harness.
+#     live-claude  REFUSES, before it makes a root or starts anything. How a
+#              test seat gets a Claude login (a copy of the credential, or a
+#              share of the live configuration) awaits the living's ruling;
+#              the ruled route is to be written in this form's branch below.
+#              When it is, starts A, B, C and case D run the real Claude
+#              harness; E, F and J stay on the stand-in, since each needs a
+#              seat that misbehaves in one known way. Only this form, once
+#              written, witnesses anything about the Claude harness.
 #     live-codex   one Codex start, List, Stop, List on an already isolated
 #              Codex endpoint the caller names in PERSONA_TEST_CODEX_CLIENT,
 #              PERSONA_TEST_CODEX_HOME and PERSONA_TEST_CODEX_CONTROL_SOCKET;
 #              the runner reads and copies no Codex credential. No transcript
 #              oracle is written for Codex yet: this form asserts Flow's
-#              answers, the pane and the process only.
+#              answers and that the pane is gone after the stop. It does not
+#              observe the Codex seat's process.
 #
 # What a run does, all under one fresh root removed at exit:
 #   its own Flow 0.17.4 (client and service from one build), its own
@@ -38,6 +42,8 @@
 #   B (one line over 800 UTF-16 units), C (one short line), and the cases
 #   that must fail: D (a skill that cannot load), E (another model), F (the
 #   first entry is not the stored prompt), J (footer kept, body altered).
+#   Seven of the eleven planned cases. G, H, I and K are not written; the
+#   report says so and what each would have covered.
 #   After each: list, a typed stop, list again, the seat's pane and process
 #   shown gone. For each, fixtures/message-flow/oracle.py reads the seat's
 #   own transcript from disk and judges it without asking Flow; Flow's
@@ -77,6 +83,14 @@ let
     herdr.package
   ];
 
+  # The runner's own PATH once its environment is emptied.
+  runnerPath = pkgs.lib.makeBinPath [
+    pkgs.coreutils
+    pkgs.jq
+    pkgs.procps
+    pkgs.gnugrep
+  ];
+
   # Flow's PATH: the Herdr CLI and the flow-id claim helper, nothing else.
   flowPath = pkgs.lib.makeBinPath [
     herdr.package
@@ -97,18 +111,53 @@ pkgs.writeShellApplication {
   meta.description = "Flow 0.17.4 live-start witness: its own Flow, Message and Herdr under one root; starts A, B, C and must-fail cases D, E, F, J judged against the seat's own transcript.";
 
   text = ''
+    # The runner's own shell starts from an emptied environment, so that no
+    # call site has to guard against what the caller exported. It re-executes
+    # itself under `env -i` with only its PATH, LANG, the PERSONA_TEST_*
+    # parameters the caller gave, and the caller's HOME and runtime directory
+    # under names of their own, kept only to refuse them as live paths below.
+    if [ "''${PERSONA_TEST_RUNNER_EMPTIED:-}" != 1 ]; then
+      carried=()
+      for carriedName in PERSONA_TEST_ROOT_BASE PERSONA_TEST_MODEL PERSONA_TEST_CODEX_CLIENT PERSONA_TEST_CODEX_HOME PERSONA_TEST_CODEX_CONTROL_SOCKET; do
+        if [ -n "''${!carriedName:-}" ]; then
+          carried+=("$carriedName=''${!carriedName}")
+        fi
+      done
+      exec env -i \
+        PERSONA_TEST_RUNNER_EMPTIED=1 \
+        PERSONA_TEST_CALLER_HOME="''${HOME:-}" \
+        PERSONA_TEST_CALLER_RUNTIME="''${XDG_RUNTIME_DIR:-}" \
+        PATH="${runnerPath}" \
+        LANG=C.UTF-8 \
+        "''${carried[@]}" \
+        "$0" "$@"
+    fi
+    for exportedName in $(compgen -e); do
+      case "$exportedName" in
+        PATH | LANG | PWD | OLDPWD | SHLVL | _ | PERSONA_TEST_RUNNER_EMPTIED | PERSONA_TEST_CALLER_HOME | PERSONA_TEST_CALLER_RUNTIME) ;;
+        PERSONA_TEST_ROOT_BASE | PERSONA_TEST_MODEL | PERSONA_TEST_CODEX_CLIENT | PERSONA_TEST_CODEX_HOME | PERSONA_TEST_CODEX_CONTROL_SOCKET) ;;
+        *)
+          echo "refusing: the runner's environment was not emptied; $exportedName survived" >&2
+          exit 70
+          ;;
+      esac
+    done
+    callerHome="''${PERSONA_TEST_CALLER_HOME:-}"
+    callerRuntime="''${PERSONA_TEST_CALLER_RUNTIME:-}"
+    unset PERSONA_TEST_CALLER_HOME PERSONA_TEST_CALLER_RUNTIME PERSONA_TEST_RUNNER_EMPTIED
+
     ${flake.lib.shellHelpers}
 
     mode="''${1:-stand-in}"
-    realClaude=""
     codexClient=""
     flowDeploymentOverrides=()
     case "$mode" in
       stand-in) ;;
       live-claude)
-        realClaude="''${2:-}"
-        requireAbsolute "the real Claude executable" "$realClaude"
-        [ -x "$realClaude" ] || { echo "refusing: $realClaude is not executable" >&2; exit 70; }
+        # The ruled login route for a test seat is to be written here. Until
+        # the living rules, this form makes no root and starts nothing.
+        echo "refusing: live-claude awaits the living's ruling on the login route for test seats (a copy of the credential, or a share of the live configuration); no root was made and nothing was started" >&2
+        exit 69
         ;;
       live-codex)
         codexClient="''${PERSONA_TEST_CODEX_CLIENT:-}"
@@ -128,7 +177,7 @@ pkgs.writeShellApplication {
         done
         ;;
       *)
-        echo "usage: message-flow [stand-in] | live-claude /absolute/path/to/claude | live-codex" >&2
+        echo "usage: message-flow [stand-in] | live-claude (refuses until ruled) | live-codex" >&2
         echo "Only a live form witnesses anything about a harness; the stand-in is not Claude." >&2
         exit 64
         ;;
@@ -163,6 +212,46 @@ pkgs.writeShellApplication {
     seatPath="${seatPath}"
     flowPath="${flowPath}"
 
+    seatHome="$stateRoot/seat/home"
+    seatDir="$stateRoot/seat/work"
+    seatClaudeConfigDir="$seatHome/.claude"
+
+    # No derived path may be, or lie under, a live one of the caller's: the
+    # runtime directory /run/user/<uid> and the caller's own, Flow's live
+    # state under the caller's HOME, Herdr's live configuration home. Each
+    # must be absolute and under this run's root. Checked before anything
+    # starts; a refusal removes the root.
+    livePaths=("/run/user/$(id -u)")
+    if [ -n "$callerRuntime" ]; then
+      livePaths+=("''${callerRuntime%/}")
+    fi
+    if [ -n "$callerHome" ]; then
+      livePaths+=("''${callerHome%/}/.local/state/flow" "''${callerHome%/}/.config/herdr")
+    fi
+    refuseLive() {
+      for livePath in "''${livePaths[@]}"; do
+        case "$2/" in
+          "$livePath"/*)
+            echo "refusing: $1 is or lies under the live path $livePath: $2" >&2
+            exit 70
+            ;;
+        esac
+      done
+    }
+    refuseLive "the run's root" "$stateRoot"
+    for derivedName in flowHome flowRuntime messageHome messageRuntime herdrConfigHome herdrStateHome herdrRuntime seatHome seatDir seatClaudeConfigDir; do
+      derivedPath="''${!derivedName}"
+      requireAbsolute "$derivedName" "$derivedPath"
+      case "$derivedPath/" in
+        "$stateRoot"/*) ;;
+        *)
+          echo "refusing: $derivedName is not under this run's root: $derivedPath" >&2
+          exit 70
+          ;;
+      esac
+      refuseLive "$derivedName" "$derivedPath"
+    done
+
     for socket in \
       "$flowRuntime/${flow.ordinarySocket}" "$flowRuntime/${flow.metaSocket}" \
       "$messageRuntime/${message.ordinarySocket}" "$messageRuntime/${message.metaSocket}" \
@@ -171,25 +260,8 @@ pkgs.writeShellApplication {
       requireSocketLength "$socket"
     done
 
-    # The seat's identity. live-claude generates it with the login
-    # projection; every other mode makes the same directories and never
-    # calls it.
-    if [ "$mode" = live-claude ]; then
-      realHome="$HOME"
-      requireAbsolute HOME "$realHome"
-      ${flake.lib.seatCredentialEnv}
-      # The official Herdr Claude hook of the pinned Herdr, so the real
-      # harness reports its session to this run's Herdr as it does live.
-      jq --arg command "${pkgs.bash}/bin/sh ${herdr.claudeHook} session" \
-        '. + {hooks: {SessionStart: [{matcher: "*", hooks: [{type: "command", command: $command, timeout: 10}]}]}}' \
-        "$seatHome/.claude/settings.json" >"$seatHome/.claude/settings.json.new"
-      mv "$seatHome/.claude/settings.json.new" "$seatHome/.claude/settings.json"
-    else
-      seatHome="$stateRoot/seat/home"
-      seatDir="$stateRoot/seat/work"
-      mkdir -p "$seatHome/.claude" "$seatDir"
-    fi
-    seatClaudeConfigDir="$seatHome/.claude"
+    # The seat's identity: plain directories under the root. No login is
+    # projected, no credential is read, and no file holding a secret is made.
     mkdir -p "$seatClaudeConfigDir/projects" "$seatDir/flows" "$seatDir/.claude/skills"
     for skill in "''${skills[@]}"; do
       cp -r "${fixtures}/skills/$skill" "$seatDir/.claude/skills/$skill"
@@ -205,7 +277,35 @@ pkgs.writeShellApplication {
     ${herdr.call}
     ${flow.call}
 
+    # Every process the runner starts is held by its PID. A Flow client call
+    # that may run long is started in the background and waited for, so a
+    # signal reaches the trap at once and the trap stops it by that PID.
+    heldPid=""
+    observerPid=""
+    held() {
+      local out="$1"
+      shift
+      "$@" >>"$out" 2>&1 &
+      heldPid=$!
+      wait "$heldPid" || true
+      heldPid=""
+    }
+    stopObserver() {
+      if [ -n "$observerPid" ]; then
+        pkill -P "$observerPid" 2>/dev/null || true
+        kill "$observerPid" 2>/dev/null || true
+        wait "$observerPid" 2>/dev/null || true
+        observerPid=""
+      fi
+    }
+
     beforeRootRemoval() {
+      if [ -n "$heldPid" ]; then
+        kill "$heldPid" 2>/dev/null
+        wait "$heldPid" 2>/dev/null
+        heldPid=""
+      fi
+      stopObserver
       ${flow.stop}
       ${message.stop}
       ${herdr.stop}
@@ -220,12 +320,19 @@ pkgs.writeShellApplication {
     ${message.start}
 
     say "message-flow — Flow 0.17.4 live-start witness"
-    say "mode: $mode$([ "$mode" = live-claude ] && printf ' (%s)' "$realClaude")"
+    say "mode: $mode"
     say "flow revision: $flowRevision (client ${flow.client})"
     say "herdr revision: ${herdr.revision}, session $herdrSession under $herdrConfigHome"
     say "harness (flow-id) revision: ${flowId.revision}"
     say "message revision: ${message.revision} (started, not driven)"
     say "root: $stateRoot (removed at exit)"
+    if [ "$mode" = stand-in ]; then
+      say "worth: every seat of this run is the stand-in, which is not Claude."
+      say "  This run proves the scenario's own logic and nothing about a real harness."
+    else
+      say "worth: the Codex seat is the endpoint the caller gave; no transcript oracle judges it,"
+      say "  and its process is not observed. Only Flow's answers and the pane are checked."
+    fi
     say ""
 
     # --- one start -------------------------------------------------------
@@ -273,20 +380,19 @@ pkgs.writeShellApplication {
       say "  revision: $flowRevision"
 
       observeLaunch "$launchId" "$caseDirectory/observe.txt" &
-      local observer=$!
-      timeout 900 env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "$datom" >"$caseDirectory/start.reply" 2>&1 || true
+      observerPid=$!
+      held "$caseDirectory/start.reply" timeout 900 env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "$datom"
       say "  start answered: $(head -c 300 "$caseDirectory/start.reply" | tr '\n' ' ')"
-      pkill -P "$observer" 2>/dev/null || true
-      kill "$observer" 2>/dev/null || true
-      wait "$observer" 2>/dev/null || true
+      stopObserver
 
       if grep -q '^StartAmbiguous' "$caseDirectory/start.reply"; then
-        timeout "$(promotionWait "$expect")" env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "Observe.Launch.$launchId" >>"$caseDirectory/observe.txt" 2>&1 || true
+        held "$caseDirectory/observe.txt" timeout "$(promotionWait "$expect")" env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "Observe.Launch.$launchId"
       fi
       flowCall "LaunchStatus.$launchId" >"$caseDirectory/final.reply" 2>&1 || true
 
-      local facts verdict flowIdentity session pane stored
+      local facts verdict flowIdentity session pane stored phases
       facts="$(${oracle} reply "$caseDirectory/observe.txt" "$caseDirectory/start.reply" "$caseDirectory/final.reply")"
+      phases="$(jq -r '(.phases // []) | join(" ")' <<<"$facts")"
       verdict="$(jq -r '.verdict // "none"' <<<"$facts")"
       flowIdentity="$(jq -r '.flow_id // ""' <<<"$facts")"
       session="$(jq -r '.session_id // ""' <<<"$facts")"
@@ -294,10 +400,19 @@ pkgs.writeShellApplication {
       stored="$(jq -r '.prompt_sha256 // ""' <<<"$facts")"
       say "  flow verdict: $verdict; flow $flowIdentity; native session $session; pane $pane"
       say "  stored prompt hash (from Flow): $stored"
+      say "  launch phases Flow reported: ''${phases:-none}"
 
       local processes
       processes="$(seatProcesses)"
       say "  seat processes: $(jq -c '[.[] | {pid, argv: (.argv | map(split("/") | last) | .[0:12])}]' <<<"$processes")"
+
+      local unavailable=""
+      for skill in "''${caseSkills[@]}"; do
+        case " ''${skills[*]} " in
+          *" $skill "*) ;;
+          *) unavailable="$skill" ;;
+        esac
+      done
 
       local judged='{"checks":[],"passed":false,"first_failed":"no-native-session"}'
       if [ -n "$session" ]; then
@@ -316,9 +431,15 @@ pkgs.writeShellApplication {
           --argjson wrapped "$wrapped" \
           --arg bundle_directory "$flowHome/.local/state/flow/launch-bundles" \
           --argjson seat_argv "$(jq -c '(.[-1].argv // [])' <<<"$processes")" \
+          --arg seat "''${choice%% *}" \
+          --arg unavailable_skill "$unavailable" \
+          --arg claude_catalog "$seatClaudeConfigDir/skills" \
+          --arg project_catalog "$seatDir/.claude/skills" \
           '{session_id: $session_id, projects: $projects, instruction: $instruction,
             stored_sha256: $stored_sha256, model: $model, effort: $effort, form: $form,
             wrapped: $wrapped, bundle_directory: $bundle_directory, seat_argv: $seat_argv,
+            seat: $seat, unavailable_skill: $unavailable_skill,
+            catalogs: [$claude_catalog, $project_catalog],
             skills: $ARGS.positional[0:($ARGS.positional | length / 2)],
             skill_paths: $ARGS.positional[($ARGS.positional | length / 2):]}' \
           --args "''${caseSkills[@]}" "''${skillPaths[@]}" >"$caseDirectory/oracle-spec.json"
@@ -343,11 +464,21 @@ pkgs.writeShellApplication {
           fi
           ;;
         unloaded-skill)
-          if [ "$verdict" != Started ] && { [ "$firstFailed" = first-entry-present ] || [ "$firstFailed" = transcript-located ] || [ "$firstFailed" = no-native-session ]; }; then
-            outcome="ok: Flow said $verdict and the seat was never given its first prompt ($firstFailed)"
+          # Pinned: Flow refuses registration after acknowledging it, the
+          # seat's own transcript exists and holds no first prompt, and the
+          # oracle found the skill in no catalog Flow reads (its check runs
+          # before first-entry-present). Any other answer or first failure
+          # fails the case. Flow names RegistrationRefused both when a skill
+          # cannot be resolved and when the prompt intent is not accepted;
+          # its answer alone cannot tell those apart, and the report says so.
+          if [ "$verdict" = StartRejected.RegistrationRefused ] &&
+            [ "$firstFailed" = first-entry-present ] &&
+            [[ " $phases " == *" RegistrationAcknowledged "* ]]; then
+            outcome="ok: Flow refused registration after acknowledging it, the seat never got its first prompt, and $unavailable is in no catalog Flow reads"
           else
-            outcome="FAILED: Flow said $verdict; transcript first failed at $firstFailed"
+            outcome="FAILED: case D wants StartRejected.RegistrationRefused after RegistrationAcknowledged, with the transcript present and no first entry; Flow said $verdict (phases: ''${phases:-none}), transcript first failed at $firstFailed"
           fi
+          say "  note: Flow's answer does not by itself name which skill failed or tell skill resolution from intent acceptance; the reason is the catalog check above."
           ;;
         *)
           if [ "$verdict" != Started ] && [ "$firstFailed" = "$expect" ]; then
@@ -429,9 +560,9 @@ pkgs.writeShellApplication {
       say "case codex — endpoint $codexClient — expect started"
       say "  command: flow '$datom'"
       say "  revision: $flowRevision"
-      timeout 900 env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "$datom" >"$caseDirectory/start.reply" 2>&1 || true
+      held "$caseDirectory/start.reply" timeout 900 env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "$datom"
       if grep -q '^StartAmbiguous' "$caseDirectory/start.reply"; then
-        timeout "$(promotionWait started)" env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "Observe.Launch.$launchId" >>"$caseDirectory/observe.txt" 2>&1 || true
+        held "$caseDirectory/observe.txt" timeout "$(promotionWait started)" env -i FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "Observe.Launch.$launchId"
       fi
       flowCall "LaunchStatus.$launchId" >"$caseDirectory/final.reply" 2>&1 || true
       local facts verdict flowIdentity pane
@@ -454,7 +585,7 @@ pkgs.writeShellApplication {
       after="$(${oracle} lifecycle "$caseDirectory/list-after.reply" "$flowIdentity")"
       say "  list after stop: $flowIdentity is $after"
       if [ "$after" = Stopped ] && ! herdrCall pane get "$pane" >/dev/null 2>&1; then
-        say "  result: ok: started, listed, stopped, pane gone"
+        say "  result: ok: started, listed, stopped, pane gone (the Codex seat's process is not observed)"
       else
         failures=$((failures + 1))
         say "  result: FAILED: after stop the flow is $after or its pane $pane remains"
@@ -469,11 +600,8 @@ pkgs.writeShellApplication {
     fi
 
     # --- the cases -------------------------------------------------------
-    if [ "$mode" = live-claude ]; then
-      harnessSeat="real $realClaude"
-    else
-      harnessSeat="stand-in faithful"
-    fi
+    # Only the stand-in reaches here: live-claude refuses above.
+    harnessSeat="stand-in faithful"
     longLine=""
     for _ in $(seq 1 13); do
       longLine+="This sentence pads the long first prompt past eight hundred units. "
@@ -489,6 +617,12 @@ pkgs.writeShellApplication {
     runCase F "stand-in footer-dropped" footer-present direct false "''${skills[@]}" -- "$twoLines"
     runCase J "stand-in body-altered" prompt-hash direct false "''${skills[@]}" -- "$twoLines"
 
+    say "not written: four of the eleven planned cases. This run covers seven (A B C D E F J)."
+    say "  G  a foreign entry in the pane before Flow's first prompt"
+    say "  H  a message delivered into the seat after its receipt"
+    say "  I  a start left ambiguous under Flow 0.17.3, re-checked under 0.17.4"
+    say "  K  a second identical first-prompt entry, which 0.17.4 is known to accept"
+    say "worth: every seat of this run was the stand-in; it proves the scenario's logic and nothing about a real harness."
     say "cases failed: $failures"
     [ "$failures" -eq 0 ]
   '';

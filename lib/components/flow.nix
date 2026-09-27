@@ -48,7 +48,11 @@
             ;;
         esac
       done
-      mkdir -p "$flowRuntime/flow"
+      # The directory Flow derives its store from, made here explicitly.
+      # flow-nexus would make it too: crates/flow-nexus/src/main.rs lines
+      # 25-26 at bc464e5e run `create_dir_all` over `state_directory()`,
+      # which store.rs line 59 defines as `$HOME/.local/state/flow`.
+      mkdir -p "$flowHome/.local/state/flow" "$flowRuntime/flow"
       chmod 700 "$flowRuntime"
       env -i \
         HOME="$flowHome" \
