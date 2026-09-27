@@ -51,14 +51,63 @@ one-line change against `flake.lib.components`.
 
 | scenario | kind | components |
 | --- | --- | --- |
-| `message-flow` | semi-sandbox (`nix run .#message-flow`) | Flow 0.16, Message 0.16 |
-| `message-flow-binaries` | pure check | Flow 0.16, Message 0.16 |
+| `message-flow` | semi-sandbox (`nix run .#message-flow -- <mode>`) | Flow 0.17.4, Message 0.16, Herdr 0.8.2, flow-id (harness 0.3.4) |
+| `message-flow-binaries` | pure check | the same, plus the stand-in and oracle programs |
+
+### `message-flow`: the Flow 0.17.4 live-start witness
+
+It witnesses whether Flow 0.17.4 (`bc464e5e1b94fcc179af73111f43b69db1f69fc5`)
+starts a Claude seat correctly, and leaves nothing behind. Everything lives
+under one root made under `/tmp` for the run and removed at its end: Flow's
+store and sockets, Message's, Herdr's configuration home and its session's
+server, the seat's home and working directory. Every socket path is checked
+against the 107 bytes an AF_UNIX address carries before anything starts.
+Each component is started under `env -i` with its whole environment written
+out, so none falls back to the host's live paths; every Flow client call
+names this run's socket; every Herdr call names this run's session.
+
+One at a time it starts a seat on `claude-haiku-4-5-20251001` at medium
+effort, aspect Field, power UltraLow, skills `spirit`, `testing`,
+`operational-final-response` (fixtures of this repository), with a first
+prompt of **A** two short lines, **B** one line over 800 UTF-16 units, **C**
+one short line; and the cases that must fail: **D** a skill that cannot
+load, **E** a seat that answers under another model, **F** a first entry
+that is not the stored prompt, **J** the footer kept and the body altered.
+After each: `List`, a typed `Stop`, `List` again, the pane and the seat's
+process shown gone. `fixtures/message-flow/oracle.py` reads the seat's own
+transcript from disk and judges it without Flow: the first entry byte for
+byte, the text less the footer hashed here and compared with the hash Flow
+stored, each skill's expansion in order, the model and effort. Flow's
+verdict and the transcript must agree; a disagreement fails the run and
+says which. The report (command, revision, result per case) is written under
+the root and printed at exit.
+
+The mode is an argument with no default:
+
+    nix run .#message-flow -- stand-in
+    nix run .#message-flow -- real /absolute/path/to/claude
+
+- **stand-in**: every seat is the stand-in of
+  `lib/components/claude-stand-in.nix`, a small program that is **not
+  Claude**. The login projection (`flake.lib.seatCredentialEnv`) is not
+  called; nothing of the living's login is read. It checks the scenario's
+  own logic and **witnesses nothing about the Claude harness**.
+- **real**: A, B, C and D run the real harness at the given path on the seat
+  identity the login projection generates, with Herdr's own Claude hook
+  added to the generated settings. **Only this mode witnesses the harness.**
+  E, F and J run on the stand-in in both modes: each needs a seat that
+  misbehaves in one known way, and they test Flow's checks, not the harness.
+
+Run it as an ordinary program outside any Herdr pane, with a time limit and
+a memory cap, for example as a transient unit of the user's service manager.
+It never reads, sets or strips the variable Herdr uses to mark a process as
+inside a pane.
 
 ## Running
 
     find . -name '*.nix' -exec nix fmt {} +
     nix flake check --no-build --option allow-import-from-derivation false
     nix flake check
-    nix run .#message-flow
+    nix run .#message-flow -- stand-in
 
 Builds go to the remote builder; never build locally.

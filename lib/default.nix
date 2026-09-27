@@ -7,28 +7,70 @@
   components = {
     flow = import ./components/flow.nix { inherit inputs; };
     message = import ./components/message.nix { inherit inputs; };
+    herdr = import ./components/herdr.nix { inherit inputs; };
+    flow-id = import ./components/flow-id.nix { inherit inputs; };
+    claude-stand-in = import ./components/claude-stand-in.nix { inherit inputs; };
   };
 
-  # A semi-sandbox's shared shell prelude: a fresh state root under
-  # `mktemp -d` and an exit trap that removes it. Every isolated home below —
-  # a tested component's or a seat's — lives under it and is removed with it.
+  # Shell helpers every semi-sandbox uses before it starts anything.
+  #   requireAbsolute NAME VALUE   refuse to go on unless VALUE is absolute
+  #   requireSocketLength PATH     refuse a socket path over the 107 bytes
+  #                                an AF_UNIX address can carry
+  #   awaitSocket PATH PID NAME    wait for PATH to become a socket while PID
+  #                                lives; fail if PID dies or 30 s pass
+  shellHelpers = ''
+    requireAbsolute() {
+      case "$2" in
+        /*) ;;
+        *)
+          echo "refusing: $1 is unset or not absolute: '$2'" >&2
+          exit 70
+          ;;
+      esac
+    }
+    requireSocketLength() {
+      requireAbsolute socket "$1"
+      if [ "$(printf '%s' "$1" | wc -c)" -gt 107 ]; then
+        echo "refusing: socket path over 107 bytes: $1" >&2
+        exit 70
+      fi
+    }
+    awaitSocket() {
+      for _ in $(seq 1 300); do
+        if [ -S "$1" ]; then
+          return 0
+        fi
+        if ! kill -0 "$2" 2>/dev/null; then
+          echo "$3 exited before $1 appeared" >&2
+          return 1
+        fi
+        sleep 0.1
+      done
+      echo "$3 did not open $1 within 30 s" >&2
+      return 1
+    }
+  '';
+
+  # A semi-sandbox's shared shell prelude: a fresh state root and an exit
+  # trap that removes it. Every isolated home below — a tested component's or
+  # a seat's — lives under it and is removed with it.
+  #
+  # The root is made under /tmp and not under $TMPDIR: every socket of a run
+  # lives under it, an AF_UNIX path carries at most 107 bytes, and a
+  # harness's TMPDIR can be long enough to break that. A scenario may define
+  # `beforeRootRemoval` to stop what it started and print its report; when
+  # defined, it runs before the root is removed, on success and on failure
+  # alike.
   isolatedStateRoot = ''
-    stateRoot="$(mktemp -d -t persona-test-XXXXXXXX)"
+    stateRoot="$(mktemp -d /tmp/pt.XXXXXXXX)"
     cleanup() {
+      if declare -F beforeRootRemoval >/dev/null; then
+        beforeRootRemoval || true
+      fi
       chmod -R u+w "$stateRoot" 2>/dev/null || true
       rm -rf "$stateRoot"
     }
     trap cleanup EXIT
-  '';
-
-  # One tested component's isolated home, runtime dir and sockets, under
-  # `$stateRoot/<name>`. Nothing is copied into it: a scenario exports these
-  # onto the component's own start/stop/client calls.
-  isolatedComponentEnv = name: ''
-    ${name}Home="$stateRoot/${name}/home"
-    ${name}Runtime="$stateRoot/${name}/run"
-    mkdir -p "$${name}Home" "$${name}Runtime"
-    chmod 700 "$${name}Runtime"
   '';
 
   # A seat's isolated identity: `$seatHome`, `$seatCodexHome` and `$seatDir`,
@@ -97,9 +139,11 @@
       > "$seatCodexHome/config.toml"
   '';
 
-  # The cheapest model per harness, the semi-sandbox default.
+  # The cheapest model per harness, the semi-sandbox default. Claude's is the
+  # dated identifier: Flow 0.17.4 titles a seat from its model, and its
+  # display map knows `claude-haiku-4-5-20251001`, not the undated alias.
   cheapestModel = {
-    claude = "claude-haiku-4-5";
+    claude = "claude-haiku-4-5-20251001";
     codex = "luna";
   };
 }
