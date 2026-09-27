@@ -1,0 +1,540 @@
+--- a/src/api/schema/agents.rs
++++ b/src/api/schema/agents.rs
+@@ -165,6 +165,10 @@
+     pub name: String,
+     pub kind: String,
+     pub pane_id: String,
++    /// Exact executable selected for this launch. When set, the path must be
++    /// absolute and present in the configured allowlist for the requested kind.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub executable: Option<String>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub args: Vec<String>,
+     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
+@@ -187,6 +191,9 @@
+     pub name: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub agent: Option<String>,
++    /// Exact executable used for a managed launch, when known.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub executable: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub title: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+--- a/src/api/schema/response.rs
++++ b/src/api/schema/response.rs
+@@ -99,6 +99,7 @@
+     },
+     AgentStarted {
+         agent: AgentInfo,
++        executable: String,
+         argv: Vec<String>,
+     },
+     AgentPrompted {
+--- a/src/api/schema/tests.rs
++++ b/src/api/schema/tests.rs
+@@ -69,6 +69,7 @@
+             name: "reviewer".into(),
+             kind: "pi".into(),
+             pane_id: "w1:p2".into(),
++            executable: None,
+             args: vec!["--no-session".into()],
+             timeout_ms: Some(30_000),
+         }),
+--- a/src/app/agents.rs
++++ b/src/app/agents.rs
+@@ -1,3 +1,4 @@
++use std::path::{Path, PathBuf};
+ use std::time::{Duration, Instant};
+ 
+ use bytes::Bytes;
+@@ -145,7 +146,7 @@
+     pub(super) fn start_agent(
+         &mut self,
+         params: AgentStartParams,
+-    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
++    ) -> Result<(crate::api::schema::AgentInfo, String, Vec<String>), AgentStartError> {
+         let name = params.name;
+         if !valid_agent_name(&name) {
+             return Err(AgentStartError::InvalidName);
+@@ -192,7 +193,9 @@
+         let shell_name = available_shell_name(runtime)
+             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
+ 
+-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
++        let executable =
++            resolve_agent_executable(kind, params.executable, &self.codex_executable_allowlist)?;
++        let mut argv = vec![executable.clone()];
+         argv.extend(params.args);
+         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+             .ok_or(AgentStartError::InvalidArgument)?;
+@@ -212,7 +215,14 @@
+             .terminals
+             .get_mut(&terminal_id)
+             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
+-        terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
++        terminal.begin_managed_agent_with_executable(
++            name.clone(),
++            kind,
++            executable.clone(),
++            now,
++            AGENT_START_SETTLE_DELAY,
++            timeout,
++        );
+         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+             terminal.clear_agent_name();
+             return Err(AgentStartError::InputFailed(err.to_string()));
+@@ -223,7 +233,7 @@
+         let agent = self
+             .agent_info(ws_idx, pane_id)
+             .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
+-        Ok((agent, argv))
++        Ok((agent, executable, argv))
+     }
+ 
+     pub(super) fn agent_start_error_body(
+@@ -243,6 +253,22 @@
+                 code: "invalid_agent_argument".into(),
+                 message: "agent arguments cannot be encoded safely for the target shell".into(),
+             },
++            AgentStartError::ExecutableUnsupportedKind(kind) => crate::api::schema::ErrorBody {
++                code: "agent_executable_unsupported_kind".into(),
++                message: format!("explicit executable selection is not supported for {kind}"),
++            },
++            AgentStartError::ExecutableNotAbsolute(path) => crate::api::schema::ErrorBody {
++                code: "agent_executable_not_absolute".into(),
++                message: format!("agent executable path must be absolute: {path}"),
++            },
++            AgentStartError::ExecutableNotAllowed(path) => crate::api::schema::ErrorBody {
++                code: "agent_executable_not_allowed".into(),
++                message: format!("agent executable is not configured for this kind: {path}"),
++            },
++            AgentStartError::ExecutableUnavailable(path) => crate::api::schema::ErrorBody {
++                code: "agent_executable_unavailable".into(),
++                message: format!("configured agent executable is missing or not executable: {path}"),
++            },
+             AgentStartError::InvalidTimeout => crate::api::schema::ErrorBody {
+                 code: "invalid_agent_timeout".into(),
+                 message: INVALID_AGENT_TIMEOUT_MESSAGE.into(),
+@@ -374,6 +400,7 @@
+             terminal_id: pane.terminal_id,
+             name: terminal.agent_name.clone(),
+             agent: pane.agent,
++            executable: terminal.managed_agent_executable().map(str::to_string),
+             title: pane.title,
+             terminal_title: pane.terminal_title,
+             terminal_title_stripped: pane.terminal_title_stripped,
+@@ -440,10 +467,59 @@
+         })
+ }
+ 
++fn resolve_agent_executable(
++    kind: crate::detect::Agent,
++    requested: Option<String>,
++    codex_allowlist: &[PathBuf],
++) -> Result<String, AgentStartError> {
++    let Some(requested) = requested else {
++        return Ok(crate::detect::interactive_agent_executable(kind).to_string());
++    };
++    if kind != crate::detect::Agent::Codex {
++        return Err(AgentStartError::ExecutableUnsupportedKind(
++            crate::detect::agent_label(kind).to_string(),
++        ));
++    }
++    let path = Path::new(&requested);
++    if !path.is_absolute() {
++        return Err(AgentStartError::ExecutableNotAbsolute(requested));
++    }
++    if !codex_allowlist.iter().any(|allowed| allowed == path) {
++        return Err(AgentStartError::ExecutableNotAllowed(requested));
++    }
++    if !selected_executable_exists(path) {
++        return Err(AgentStartError::ExecutableUnavailable(requested));
++    }
++    Ok(requested)
++}
++
++fn selected_executable_exists(path: &Path) -> bool {
++    let Ok(metadata) = path.metadata() else {
++        return false;
++    };
++    if !metadata.is_file() {
++        return false;
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        metadata.permissions().mode() & 0o111 != 0
++    }
++    #[cfg(windows)]
++    {
++        true
++    }
++}
++
++#[derive(Debug)]
+ pub(super) enum AgentStartError {
+     InvalidName,
+     UnsupportedKind(String),
+     InvalidArgument,
++    ExecutableUnsupportedKind(String),
++    ExecutableNotAbsolute(String),
++    ExecutableNotAllowed(String),
++    ExecutableUnavailable(String),
+     InvalidTimeout,
+     TargetNotFound(String),
+     TargetBusy(String),
+@@ -468,7 +544,9 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::valid_agent_name;
++    use std::fs;
++
++    use super::{resolve_agent_executable, valid_agent_name, AgentStartError};
+ 
+     #[test]
+     fn agent_names_use_a_small_cli_safe_grammar() {
+@@ -488,4 +566,61 @@
+             assert!(!valid_agent_name(name), "expected {name:?} to be invalid");
+         }
+     }
++
++    #[cfg(unix)]
++    #[test]
++    fn codex_executable_selection_is_exact_and_fails_closed() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let directory = std::env::temp_dir().join(format!(
++            "herdr-codex-executable-test-{}",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&directory);
++        fs::create_dir(&directory).unwrap();
++        let next = directory.join("codex-next");
++        fs::write(&next, "#!/bin/sh\nexit 0\n").unwrap();
++        fs::set_permissions(&next, fs::Permissions::from_mode(0o755)).unwrap();
++        let allowed = vec![next.clone()];
++
++        assert_eq!(
++            resolve_agent_executable(crate::detect::Agent::Codex, None, &allowed).unwrap(),
++            "codex"
++        );
++        assert_eq!(
++            resolve_agent_executable(
++                crate::detect::Agent::Codex,
++                Some(next.display().to_string()),
++                &allowed,
++            )
++            .unwrap(),
++            next.display().to_string()
++        );
++        assert!(matches!(
++            resolve_agent_executable(
++                crate::detect::Agent::Codex,
++                Some("codex-next".into()),
++                &allowed,
++            ),
++            Err(AgentStartError::ExecutableNotAbsolute(_))
++        ));
++        assert!(matches!(
++            resolve_agent_executable(
++                crate::detect::Agent::Codex,
++                Some(directory.join("other").display().to_string()),
++                &allowed,
++            ),
++            Err(AgentStartError::ExecutableNotAllowed(_))
++        ));
++        fs::remove_file(&next).unwrap();
++        assert!(matches!(
++            resolve_agent_executable(
++                crate::detect::Agent::Codex,
++                Some(next.display().to_string()),
++                &allowed,
++            ),
++            Err(AgentStartError::ExecutableUnavailable(_))
++        ));
++        fs::remove_dir(&directory).unwrap();
++    }
+ }
+--- a/src/app/api/agents.rs
++++ b/src/app/api/agents.rs
+@@ -51,12 +51,19 @@
+     }
+ 
+     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
+-        let (agent, argv) = match self.start_agent(params) {
++        let (agent, executable, argv) = match self.start_agent(params) {
+             Ok(started) => started,
+             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
+         };
+ 
+-        encode_success(id, ResponseResult::AgentStarted { agent, argv })
++        encode_success(
++            id,
++            ResponseResult::AgentStarted {
++                agent,
++                executable,
++                argv,
++            },
++        )
+     }
+ 
+     pub(super) fn handle_agent_prompt(&mut self, id: String, params: AgentPromptParams) -> String {
+--- a/src/app/mod.rs
++++ b/src/app/mod.rs
+@@ -98,6 +98,7 @@
+ }
+ 
+ pub struct App {
++    pub(crate) codex_executable_allowlist: Vec<std::path::PathBuf>,
+     pub state: AppState,
+     pub(crate) pane_graphics: pane_graphics::Runtime,
+     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
+@@ -755,6 +756,7 @@
+         });
+ 
+         let mut app = Self {
++            codex_executable_allowlist: config.agents.codex_executables.clone(),
+             config_diagnostic_deadline: None,
+             toast_deadline: None,
+             copy_feedback_deadline: None,
+@@ -1445,6 +1447,10 @@
+         let invalid_section =
+             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
+ 
++        if !invalid_section("agents") {
++            self.codex_executable_allowlist = config.agents.codex_executables.clone();
++        }
++
+         if !invalid_section("keys") {
+             match config.live_keybinds_with_diagnostics() {
+                 Ok((live, keybind_diagnostics)) => {
+@@ -4805,6 +4811,7 @@
+                 name: "worker".into(),
+                 kind: "pi".into(),
+                 pane_id,
++                executable: None,
+                 args: Vec::new(),
+                 timeout_ms: Some(1_000),
+             }),
+@@ -4847,6 +4854,7 @@
+                 name: "worker".into(),
+                 kind: "pi".into(),
+                 pane_id: pane_id.clone(),
++                executable: None,
+                 args: Vec::new(),
+                 timeout_ms: Some(4_000),
+             }),
+--- a/src/cli/agent.rs
++++ b/src/cli/agent.rs
+@@ -274,7 +274,7 @@
+ 
+ fn agent_start(args: &[String]) -> std::io::Result<i32> {
+     let Some(name) = args.first() else {
+-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
++        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--executable ABSOLUTE_PATH] [--timeout MS] [-- <agent-args...>]");
+         return Ok(2);
+     };
+     let separator = args
+@@ -284,6 +284,7 @@
+     let mut kind = None;
+     let mut pane_id = None;
+     let mut timeout_ms = None;
++    let mut executable = None;
+     let mut index = 1;
+     while index < separator {
+         match args[index].as_str() {
+@@ -314,6 +315,14 @@
+                 };
+                 index += 2;
+             }
++            "--executable" => {
++                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
++                    eprintln!("missing value for --executable");
++                    return Ok(2);
++                };
++                executable = Some(value.clone());
++                index += 2;
++            }
+             other => {
+                 eprintln!("unknown option: {other}");
+                 return Ok(2);
+@@ -361,6 +370,7 @@
+                 name: name.clone(),
+                 kind: kind.clone(),
+                 pane_id: pane_id.clone(),
++                executable: executable.clone(),
+                 args: agent_args.clone(),
+                 timeout_ms,
+             }),
+@@ -917,7 +927,7 @@
+     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
+     eprintln!("  herdr agent attach <target> [--takeover]");
+     eprintln!(
+-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
++        "  herdr agent start <name> --kind KIND --pane ID [--executable ABSOLUTE_PATH] [--timeout MS] [-- <agent-args...>]"
+     );
+     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
+     eprintln!(
+--- a/src/cli/spec.rs
++++ b/src/cli/spec.rs
+@@ -423,6 +423,10 @@
+                         .help("Existing pane at an interactive shell prompt"),
+                 )
+                 .arg(
++                    option("executable", "ABSOLUTE_PATH")
++                        .help("Exact configured executable for this launch"),
++                )
++                .arg(
+                     option("timeout", "MS")
+                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
+                 )
+--- a/src/config/io.rs
++++ b/src/config/io.rs
+@@ -6,6 +6,7 @@
+ 
+ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
+     "advanced",
++    "agents",
+     "experimental",
+     "keys",
+     "onboarding",
+@@ -263,6 +264,14 @@
+ 
+     load_live_section(
+         table,
++        "agents",
++        "agent config",
++        &mut diagnostics,
++        &mut invalid_sections,
++        |section| config.agents = section,
++    );
++    load_live_section(
++        table,
+         "theme",
+         "theme config",
+         &mut diagnostics,
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::BTreeSet, num::NonZeroUsize};
++use std::{collections::BTreeSet, num::NonZeroUsize, path::PathBuf};
+ 
+ use crossterm::event::KeyModifiers;
+ use serde::{de, Deserialize, Deserializer, Serialize};
+@@ -315,6 +315,7 @@
+ #[derive(Debug, Default, Deserialize)]
+ #[serde(default)]
+ pub struct Config {
++    pub agents: AgentsConfig,
+     pub onboarding: Option<bool>,
+     pub theme: ThemeConfig,
+     pub terminal: TerminalConfig,
+@@ -329,6 +330,13 @@
+     pub remote: RemoteConfig,
+ }
+ 
++#[derive(Debug, Clone, Default, Deserialize)]
++#[serde(default)]
++pub struct AgentsConfig {
++    /// Absolute executable paths accepted by `agent.start --executable` for Codex.
++    pub codex_executables: Vec<PathBuf>,
++}
++
+ #[derive(Debug)]
+ pub struct LoadedConfig {
+     pub config: Config,
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -160,6 +160,11 @@
+ # "current" for Herdr's process directory, or a fixed path such as "~/Projects".
+ # new_cwd = "follow"
+ 
++[agents]
++# Exact absolute Codex executable paths accepted by `herdr agent start --executable`.
++# The canonical `codex` executable remains the default when this option is omitted.
++# codex_executables = ["/nix/store/.../bin/codex-next"]
++
+ [update]
+ # Update channel used by background version checks and `herdr update`.
+ # Stable builds default to "stable". Windows preview builds default to "preview"
+--- a/src/terminal/state.rs
++++ b/src/terminal/state.rs
+@@ -133,6 +133,7 @@
+     pub agent_name: Option<String>,
+     agent_name_owner: Option<AgentNameOwner>,
+     managed_agent: Option<ManagedAgent>,
++    managed_agent_executable: Option<String>,
+     hook_report_sequences: HashMap<String, u64>,
+     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
+     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
+@@ -167,6 +168,7 @@
+             agent_name: None,
+             agent_name_owner: None,
+             managed_agent: None,
++            managed_agent_executable: None,
+             hook_report_sequences: HashMap::new(),
+             suppressed_full_lifecycle_hook_reports: HashMap::new(),
+             stale_full_lifecycle_hook_sessions: HashMap::new(),
+@@ -1901,6 +1903,25 @@
+         settle_delay: Duration,
+         timeout: Duration,
+     ) {
++        self.begin_managed_agent_with_executable(
++            name,
++            kind,
++            crate::detect::interactive_agent_executable(kind).to_string(),
++            now,
++            settle_delay,
++            timeout,
++        );
++    }
++
++    pub fn begin_managed_agent_with_executable(
++        &mut self,
++        name: String,
++        kind: Agent,
++        executable: String,
++        now: Instant,
++        settle_delay: Duration,
++        timeout: Duration,
++    ) {
+         self.set_agent_name(name);
+         self.agent_name_owner = Some(AgentNameOwner {
+             agent_label: crate::detect::agent_label(kind).to_string(),
+@@ -1914,6 +1935,7 @@
+                 observed_expected: false,
+             },
+         });
++        self.managed_agent_executable = Some(executable);
+     }
+ 
+     pub fn managed_agent_launch_pending(&self) -> bool {
+@@ -1934,6 +1956,10 @@
+         self.managed_agent.map(|managed| managed.kind)
+     }
+ 
++    pub fn managed_agent_executable(&self) -> Option<&str> {
++        self.managed_agent_executable.as_deref()
++    }
++
+     pub fn next_managed_agent_deadline(&self) -> Option<Instant> {
+         let ManagedAgentPhase::Pending {
+             ready_after,
+@@ -2038,12 +2064,15 @@
+             kind,
+             phase: ManagedAgentPhase::Active,
+         });
++        self.managed_agent_executable =
++            Some(crate::detect::interactive_agent_executable(kind).to_string());
+     }
+ 
+     pub fn clear_agent_name(&mut self) {
+         self.agent_name = None;
+         self.agent_name_owner = None;
+         self.managed_agent = None;
++        self.managed_agent_executable = None;
+     }
+ 
+     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
