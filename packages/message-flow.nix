@@ -1,14 +1,8 @@
-# message-flow — the Flow + Message semi-sandbox runner.
+# message-flow — the Flow + Herdr + Message semi-sandbox runner.
 #
-# Run it as `nix run .#message-flow`. It is a runner, never a check: each
-# tested Nexus gets its own isolated HOME/XDG_RUNTIME_DIR/state/sockets under
-# a fresh state root, and any seat Flow launches gets its own isolated
-# identity too — its credential files copied in, everything else generated
-# fresh (see `flake.lib.seatCredentialEnv`) — removed in an exit trap. No
-# config file is ever copied.
-#
-# This is the skeleton. The scenario drive and its assertions belong in the
-# marked section below.
+# This runner never reads or copies credentials. A live run receives an
+# already-isolated Codex endpoint from its caller; the test state, sockets and
+# Herdr allowlist are generated under one fresh root and removed on exit.
 {
   pkgs,
   flake,
@@ -18,6 +12,7 @@
 let
   components = flake.lib.components;
   flow = components.flow.forSystem system;
+  herdr = components.herdr.forSystem system;
   message = components.message.forSystem system;
 in
 pkgs.writeShellApplication {
@@ -25,64 +20,77 @@ pkgs.writeShellApplication {
 
   runtimeInputs = [
     pkgs.coreutils
-    pkgs.jq
+    pkgs.gnused
+    pkgs.ripgrep
+    pkgs.util-linux
+    herdr.package
   ];
 
-  meta.description = "Flow 0.16 + Message 0.16 semi-sandbox: each Nexus and any seat it launches isolated on its own generated identity, driven with the cheapest model.";
+  meta.description = "Flow 0.17.4 + Herdr + Message semi-sandbox with a bounded Start/List/Stop scenario.";
 
   text = ''
-    realHome="$HOME"
-    realRuntimeDir="''${XDG_RUNTIME_DIR:-}"
-    model="''${PERSONA_TEST_MODEL:-${flake.lib.cheapestModel.claude}}"
+    model="''${PERSONA_TEST_MODEL:-${flake.lib.cheapestModel.codex}}"
+    codexClient="''${PERSONA_TEST_CODEX_CLIENT:?set PERSONA_TEST_CODEX_CLIENT to an isolated Codex executable}"
+    codexHome="''${PERSONA_TEST_CODEX_HOME:?set PERSONA_TEST_CODEX_HOME to its isolated home}"
+    codexControlSocket="''${PERSONA_TEST_CODEX_CONTROL_SOCKET:?set PERSONA_TEST_CODEX_CONTROL_SOCKET to its isolated control socket}"
 
     ${flake.lib.isolatedStateRoot}
-
     ${flake.lib.isolatedComponentEnv "flow"}
     ${flake.lib.isolatedComponentEnv "message"}
-    ${flake.lib.seatCredentialEnv}
+    ${herdr.isolatedConfig "$codexClient"}
 
-    # Flow's own state is isolated; any seat it launches gets the generated
-    # identity above, never the living's real ~/.claude.json or
-    # ~/.codex/config.toml.
+    herdrHome="$stateRoot/herdr/home"
+    mkdir -p "$herdrHome"
+    export HOME="$herdrHome"
+    script -qfc '${herdr.client} session attach message-flow' /dev/null >/dev/null 2>&1 &
+    herdrClientPid=$!
+    for _ in $(seq 1 100); do
+      ${herdr.client} --session message-flow pane list >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    ${herdr.client} --session message-flow pane list >/dev/null
+
+    sourceRoot="$stateRoot/source"
+    mkdir -p "$sourceRoot"
+    printf '%s\n' 'Start, List, and Stop are the bounded message-flow scenario.' > "$sourceRoot/brief.md"
+    briefHash="$(sha256sum "$sourceRoot/brief.md" | cut -d ' ' -f 1)"
+
+    # Source assertions: only the generated Herdr config is inherited, and
+    # the configured Codex executable is its sole allowlist entry.
+    test "$XDG_CONFIG_HOME" = "$herdrConfigHome"
+    rg -Fx "codex_executables = [ \"$codexClient\" ]" "$herdrConfigHome/herdr/config.toml"
+
     export HOME="$flowHome"
     export XDG_RUNTIME_DIR="$flowRuntime"
-    export CODEX_HOME="$seatCodexHome"
-    export CLAUDE_CONFIG_DIR="$seatHome/.claude"
+    export CODEX_HOME="$codexHome"
+    export FLOW_SOURCE_ROOT="$sourceRoot"
+    ${flow.start}
+    FLOW_META_SOCKET="$flowRuntime/${flow.metaSocket}" ${flow.metaClient} "Configure.{ $flowRuntime/${flow.ordinarySocket} $flowRuntime/${flow.metaSocket} $sourceRoot { $codexClient $codexHome $codexControlSocket [ $model ] } { $codexClient $codexHome $codexControlSocket [ $model ] } [ { Codex [ / «!» ] [ esc ] [] } ] [ Psyche ] ${message.nexus} }" | rg -x 'Configured\..*'
+    ${flow.stop}
     ${flow.start}
 
     export HOME="$messageHome"
     export XDG_RUNTIME_DIR="$messageRuntime"
-    unset CODEX_HOME CLAUDE_CONFIG_DIR
+    unset CODEX_HOME
     ${message.start}
 
-    export HOME="$realHome"
-    export XDG_RUNTIME_DIR="$realRuntimeDir"
-
-    # --- scenario: drive and assertions go here -------------------------
-    # The sandbox scenario suite for Flow 0.16 + Message 0.16 moves its
-    # scenario body into this section, using:
-    #   ${flow.client} / ${flow.metaClient}      reach Flow via:
-    #     XDG_RUNTIME_DIR="$flowRuntime" ${flow.client} ...
-    #   ${message.client} / ${message.metaClient} reach Message via:
-    #     XDG_RUNTIME_DIR="$messageRuntime" ${message.client} ...
-    #   $model             the cheapest model, overridable by PERSONA_TEST_MODEL
-    #   $seatHome/$seatCodexHome/$seatDir   the seat identity a Flow-launched
-    #                      Claude or Codex sees; $seatHome/.claude.json and
-    #                      $seatCodexHome/config.toml are plain writable
-    #                      files, not store paths, so a seat may write back
-    #                      to them during the run.
-    #   $stateRoot         the isolated root, removed on exit
-    #
-    # Left for the suite move: Herdr's own config and allowlist for the
-    # sandbox's session — Flow launches seats through Herdr, whose
-    # executable allowlist and per-session config are not yet generated
-    # here, only Claude's and Codex's own files.
-    echo "message-flow: skeleton only — Flow on $flowRuntime, Message on $messageRuntime, seat on $seatDir, model $model"
-    # --------------------------------------------------------------------
+    # Start → List → Stop. Flow checks brief.md's exact hash before launch;
+    # List observes the row; Stop closes the bound Herdr pane. The supplied
+    # endpoint owns any authentication, outside this runner.
+    startReply="$(FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "Start.{ { message-flow-start [ { brief.md $briefHash } ] [] Psyche Low Codex $model low None [] message-flow $sourceRoot/brief.md «FLOW_LAUNCH_RECEIPT_V2» } { owner owner owner } }")"
+    printf '%s\n' "$startReply" | rg -x 'Started\..*'
+    flowId="$(printf '%s\n' "$startReply" | sed -n 's/^Started\.\({ \)?\([^ }]*\).*/\2/p')"
+    test -n "$flowId"
+    FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} 'List.{}' | rg -F "$flowId"
+    FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} "Stop.$flowId" | rg -x 'Stopped\..*'
+    FLOW_SOCKET="$flowRuntime/${flow.ordinarySocket}" ${flow.client} 'List.{}' | rg -F "$flowId" | rg -F 'Stopped'
 
     export XDG_RUNTIME_DIR="$messageRuntime"
     ${message.stop}
     export XDG_RUNTIME_DIR="$flowRuntime"
     ${flow.stop}
+    ${herdr.client} --session message-flow server stop || true
+    kill "$herdrClientPid" 2>/dev/null || true
+    wait "$herdrClientPid" 2>/dev/null || true
   '';
 }

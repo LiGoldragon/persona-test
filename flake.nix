@@ -7,7 +7,7 @@
     blueprint.url = "github:numtide/blueprint";
     blueprint.inputs.nixpkgs.follows = "nixpkgs";
 
-    flow.url = "github:LiGoldragon/flow/9aa9bf88e3ff6f3b68864eb300ee009897162ef4";
+    flow.url = "github:LiGoldragon/flow/bc464e5e1b94fcc179af73111f43b69db1f69fc5";
     flow.inputs.nixpkgs.follows = "nixpkgs";
 
     message.url = "github:LiGoldragon/message/f1843dbaa63f38634dc10d3b28df2f4a482d6d35";

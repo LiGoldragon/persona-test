@@ -51,8 +51,8 @@ one-line change against `flake.lib.components`.
 
 | scenario | kind | components |
 | --- | --- | --- |
-| `message-flow` | semi-sandbox (`nix run .#message-flow`) | Flow 0.16, Message 0.16 |
-| `message-flow-binaries` | pure check | Flow 0.16, Message 0.16 |
+| `message-flow` | semi-sandbox (`nix run .#message-flow`) | Flow 0.17.4, Herdr, Message 0.16 |
+| `message-flow-binaries` | pure check | Flow 0.17.4, Message 0.16 |
 
 ## Running
 

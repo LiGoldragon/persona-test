@@ -6,6 +6,7 @@
   # one-line change here.
   components = {
     flow = import ./components/flow.nix { inherit inputs; };
+    herdr = import ./components/herdr.nix { inherit inputs; };
     message = import ./components/message.nix { inherit inputs; };
   };
 
